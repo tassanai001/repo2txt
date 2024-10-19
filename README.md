@@ -56,3 +56,11 @@ By default, if no path is specified, the script operates in the current director
 ## Contributing
 Contributions to enhance `repo2txt` are always welcome. Feel free to fork the repository, make your improvements, and submit a pull request.
 
+## Example command
+python3 repo2txt.py -r /Users/tassanaiyeeton/projects/ipop-mobile-front-end
+-o /Users/tassanaiyeeton/projects/ipop-back-end-2-text/mobile-output.txt --exclude-dir build android ios .png --ignore-files iamconsulting_ipop.jks upload_certificate.pem
+
+
+## Example ipop-mobile
+python3 repo2txt.py -r /Users/tassanaiyeeton/projects/ipop-mobile-front-end/lib -o /Users/tassanaiyeeton/projects/repo2txt/output/ipop-mobile-front-end.txt --exclude-dir build libs
+build android ios .png --ignore-files iamconsulting_ipop.jks upload_certificate.pem

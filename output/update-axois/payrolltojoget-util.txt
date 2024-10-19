@@ -1,0 +1,1175 @@
+Repository Documentation
+This document provides a comprehensive overview of the repository's structure and contents.
+The first section, titled 'Directory/File Tree', displays the repository's hierarchy in a tree format.
+In this section, directories and files are listed using tree branches to indicate their structure and relationships.
+Following the tree representation, the 'File Content' section details the contents of each file in the repository.
+Each file's content is introduced with a '[File Begins]' marker followed by the file's relative path,
+and the content is displayed verbatim. The end of each file's content is marked with a '[File Ends]' marker.
+This format ensures a clear and orderly presentation of both the structure and the detailed contents of the repository.
+
+Directory/File Tree Begins -->
+
+payrolltojoget/
+└── util.js
+
+<-- Directory/File Tree Ends
+
+File Content Begin -->
+[File Begins] util.js
+// const XLSX = require('xlsx');
+const FunctionReturn = require('../../../../models/common/FunctionReturn').FunctionReturn;
+const DBProcess = require('./dbprocess').DBProcess;
+const JOGETService = require('./service').JOGETService;
+const db = require('../../../../config/sequelize/sequelize').getConfig();
+const arrayUtil = require('../../../../utils/array');
+const Sequelize = require('sequelize');
+const Op = Sequelize.Op;
+const helper = require('../../../../utils/helper');
+const sh = require('../../../../utils/searchhelp');
+const reqContext = require('../../../../utils/requestcontext');
+const moment = require('moment');
+const jsonUtil = require('../../../../utils/json');
+const translation = require('../../../../utils/translation');
+const globalConstant = require('../../../../config/constant');
+const ExcelForm = require('./excelform').ExcelForm;
+const Permission = require('../../../../utils/authorization/permission/permission').Permission; //Check permission
+const mathUtil = require('../../../../utils/math');
+const axios = require('axios');
+
+const connCode = 'JOGETAPI';
+
+class Util {
+
+  async initPage() {
+
+    let functionReturn = new FunctionReturn();
+    const dbProcess = new DBProcess();
+    let companyList = [];
+    let payrollAreaList = [];
+    let empCodeList = [];
+    let prGroupList = [];
+    let payrollPeriodList = [];
+    try {
+      let condition = {
+        startDate: {
+          [Op.lte]: new Date(),
+        },
+        endDate: {
+          [Op.gte]: new Date(),
+        },
+      };
+      payrollPeriodList = await sh.getPayrollPeriod();
+      companyList = await sh.getCompany({});
+      payrollAreaList = await sh.getPayrollArea({});
+      // empCodeList = await sh.getAvailableEmpList({});
+      let paramSHEmp = {
+        condition: {},
+        allEmployee: true,
+        checkPerAssign: true
+      };
+      empCodeList = await sh.getNewAvailableEmpList(paramSHEmp); //NEW
+
+      condition = {
+        prStartDate: { [Op.lte]: new Date() },
+        prEndDate: { [Op.gte]: new Date() },
+      };
+      prGroupList = await dbProcess.getSYMCPRGroupHeader(condition);
+
+      //-----Check permission-----//
+      let permsParam = {
+        replaceEmptyList: false,
+        checkObjectList: [
+          {
+            objectType: globalConstant.permissionObjectType.company,
+            objectList: companyList,
+            codeColumn: 'comCode'
+          },
+          {
+            objectType: globalConstant.permissionObjectType.payrollArea,
+            objectList: payrollAreaList,
+            codeColumn: 'payrollArea'
+          },
+          {
+            objectType: globalConstant.permissionObjectType.employee,
+            objectList: empCodeList,
+            codeColumn: 'key'
+          },
+        ],
+      };
+      let permission = new Permission();
+      let permsReturn = await permission.checkObjectPermission(permsParam);
+      if (permsReturn.success) {
+        companyList = permsReturn.result.checkResult.companyList;
+        payrollAreaList = permsReturn.result.checkResult.payrollAreaList;
+        empCodeList = permsReturn.result.checkResult.empList;
+      }
+      //-----End check permission-----//
+
+      let currentPeriod = {};
+      let payrollArea = '';
+      if (payrollAreaList.length > 0) {
+        payrollArea = payrollAreaList[0].payrollAreaCode;
+        currentPeriod = payrollPeriodList.find(elem => elem.payrollAreaCode == payrollAreaList[0].payrollAreaCode &&
+          moment(elem.startDate).isSameOrBefore(moment(), 'day') &&
+          moment(elem.endDate).isSameOrAfter(moment(), 'day'));
+      }
+
+      //Concate PR Group code
+      for (let i = 0; i < prGroupList.length; i++) {
+        prGroupList[i].prPaidToName = prGroupList[i].prGroup + ' - ' + prGroupList[i].prPaidToName;
+      }
+
+      functionReturn.success = true;
+      functionReturn.result = {
+        period: (currentPeriod.period) ? currentPeriod.period : '',
+        year: (currentPeriod.year) ? currentPeriod.year : '',
+        companySH: companyList,
+        payType: 'NOR',
+        invoiceDate: new Date(),
+        payrollArea: payrollArea,
+        payrollAreaSH: payrollAreaList,
+        employeeSH: empCodeList,
+        prGroupSH: prGroupList,
+        payrollPeriodSH: payrollPeriodList,
+        selectEmpType: 'ALL',
+      };
+
+    } catch (error) {
+      helper.logMessage('error', error.stack, 'tenant/symc/payrolltojoget/util - initPage', '', '', '', '');
+      functionReturn.success = false;
+      functionReturn.message = translation.getTranslateText('common.error.exception');
+    }
+
+    return functionReturn;
+
+  }
+
+  async execute(param) {
+    let functionReturn = new FunctionReturn();
+    let excelForm = new ExcelForm();
+    try {
+      let selection = param.selection;
+      let resultDataList = [];
+      let excelFieldList = [];
+      let bgProcess = param.bgProcess;
+
+      //Check permission
+      functionReturn.clear();
+      functionReturn = await this.adjustSelection(selection);
+      if (!functionReturn.success) {
+        // bgProcess.handleError(functionReturn, res);
+        return functionReturn;
+      }
+
+      //Prepare data
+      functionReturn = await this.prepareData(param);
+      if (!functionReturn.success) {
+        return functionReturn;
+      }
+
+      resultDataList = functionReturn.result.data;
+      excelFieldList = functionReturn.result.excelFieldList;
+
+      let resultParam = {
+        selection: selection,
+        resultDataList: resultDataList,
+        excelFieldList: excelFieldList
+      }
+
+      //Process to JOGET
+      if (selection.transferToJogetFlag) {
+        //Update before send
+
+        bgProcess.updateStepProgress(globalConstant.bgStepProcessData.id, 0, 1);
+        functionReturn = await this.processToJoget(resultParam);
+        if (functionReturn.success) {
+
+        }
+        bgProcess.updateStepProgress(globalConstant.bgStepProcessData.id, 1, 1);
+
+        //Update after send
+      }
+
+      bgProcess.updateStepProgress(globalConstant.bgStepProcessFile.id, 0, 1);
+      //Prepare excel
+      let excel = new ExcelForm();
+      functionReturn = await excel.main(resultParam);
+      bgProcess.updateStepProgress(globalConstant.bgStepProcessFile.id, 1, 1);
+
+
+    } catch (error) {
+      helper.logMessage('error', error.stack, 'tenant/symc/payrolltojoget/util - execute', '', '', '', '');
+      functionReturn.success = false;
+      functionReturn.message = translation.getTranslateText('common.error.exception');
+    }
+
+    return functionReturn;
+  }
+
+  async adjustSelection(selection) {
+    let functionReturn = new FunctionReturn();
+    try {
+      let permsParam = {
+        replaceEmptyList: true,
+        checkObjectList: [
+          { objectType: globalConstant.permissionObjectType.company, objectList: [selection.comCode] },
+          { objectType: globalConstant.permissionObjectType.payrollArea, objectList: [selection.payrollArea] },
+          { objectType: globalConstant.permissionObjectType.employee, objectList: selection.empCodeList },
+        ]
+      }
+
+      let permission = new Permission();
+      let permsReturn = await permission.checkObjectPermission(permsParam);
+      if (permsReturn.success) {
+        if (!arrayUtil.isEmpty(permsReturn.result.checkResult.companyList)) {
+          selection.compCode = permsReturn.result.checkResult.companyList[0];
+        } else {
+          selection.compCode = null;
+        }
+        if (!arrayUtil.isEmpty(permsReturn.result.checkResult.payrollAreaList)) {
+          selection.payrollArea = permsReturn.result.checkResult.payrollAreaList[0];
+        } else {
+          selection.payrollArea = null;
+        }
+        selection.empCodeList = permsReturn.result.checkResult.empList;
+        functionReturn.success = true;
+      } else {
+        functionReturn.success = false;
+        functionReturn.message = permsReturn.message;
+      }
+    } catch (error) {
+      helper.logMessage('error', error.stack, 'tenant/symc/payrolltojoget/util - adjustSelection', '', '', '', '')
+      functionReturn.success = false
+      functionReturn.message = translation.getTranslateText('common.error.exception');
+    }
+    return functionReturn;
+  }
+
+  async prepareData(param) {
+
+    let functionReturn = new FunctionReturn();
+
+    try {
+      let selection = param.selection;
+      let bgProcess = param.bgProcess;
+      let empDataList = [];
+      let payrollAreaList = [];
+      let payrollPeriodList = [];
+      let payrollResultDirList = [];
+      let pywpbpList = [];
+      let prGroupHList = [];
+      let prGroupDList = [];
+      let startDate;
+      let endDate;
+      let period;
+      let year;
+      let resultDataList = [];
+      let countProgress = 0;
+      let totalDatabase = 6;
+      let numOfTime = 1;
+
+      //Get PR Group Data
+      functionReturn = await this.getPRGroup(selection);
+      if (functionReturn.success) {
+        prGroupHList = functionReturn.result.prGroupHList;
+        prGroupDList = functionReturn.result.prGroupDList;
+      } else {
+        return functionReturn;
+      }
+      bgProcess.updateStepProgress(globalConstant.bgStepSelectData.id, ++countProgress, totalDatabase);
+
+      //Employee
+      // let empCondition = {
+      //   condition: {
+      //   }
+      // };
+      let paramSHEmp = {
+        condition: {},
+        allEmployee: true,
+        checkPerAssign: true,
+      };
+
+      if (!arrayUtil.isEmpty(selection.empCodeList)) {
+        // empCondition.condition.empCode = selection.empCodeList;
+        paramSHEmp.condition = {
+          personalData: { empCode: selection.empCodeList }
+        };
+      }
+
+
+      // empDataList = await sh.getAvailableEmpList(empCondition);
+      empDataList = await sh.getNewAvailableEmpList(paramSHEmp); //NEW
+
+      selection.empDataList = empDataList;
+      selection.empCodeList = empDataList.map(a => a.key);
+      bgProcess.updateStepProgress(globalConstant.bgStepSelectData.id, ++countProgress, totalDatabase);
+
+      //Payroll period
+      functionReturn = await this.getPayrollPeriod(selection);
+      if (functionReturn.success) {
+        payrollPeriodList = functionReturn.result.payrollPeriodList;
+        startDate = functionReturn.result.startDate;
+        endDate = functionReturn.result.endDate;
+        period = functionReturn.result.period;
+        year = functionReturn.result.year;
+      } else {
+        return functionReturn;
+      }
+      bgProcess.updateStepProgress(globalConstant.bgStepSelectData.id, ++countProgress, totalDatabase);
+
+      //Payroll Result Data
+      selection.payrollPeriodList = payrollPeriodList;
+      selection.payrollAreaList = payrollAreaList;
+      selection.startDate = startDate;
+      selection.endDate = endDate;
+      selection.period = period;
+      selection.year = year;
+      functionReturn = await this.getPayrollResultData(selection);
+      if (functionReturn.success) {
+        payrollResultDirList = functionReturn.result.payrollResultDirList;
+        pywpbpList = functionReturn.result.pywpbpResultList;
+        // rtList = functionReturn.result.rtResultList;
+      } else {
+        return functionReturn;
+      }
+      bgProcess.updateStepProgress(globalConstant.bgStepSelectData.id, ++countProgress, totalDatabase);
+
+      //Check last posted result in period
+      functionReturn = await this.getLastPostedResult(selection);
+      if (functionReturn.success) {
+        numOfTime = functionReturn.result.numOfTime + 1;
+      }
+      bgProcess.updateStepProgress(globalConstant.bgStepSelectData.id, ++countProgress, totalDatabase);
+
+      //Filter PYWPBP with comCode
+      pywpbpList = pywpbpList.filter(elem => elem.comCode == selection.comCode);
+
+      //Prepare data 
+      let structure = this.prepareStructure();
+      let tmpResult = structure.data;
+      let arrayField = structure.fieldList;
+
+      let seq = 0;
+      let tmpInvoiceTotal = {};
+      let tmpItemTotal = {};
+      let empCount = {};
+      let processBy = await reqContext.getCurrentUsername();
+      let postDateTime = new Date();
+      let currentDate = moment();
+      let currentDateBE = moment().add(543, 'year');
+      for (let prGroupH of prGroupHList) {
+
+        let prGroupDByHList = prGroupDList.filter(elem => elem.prGroupHeaderID == prGroupH.id);
+        if (arrayUtil.isEmpty(prGroupDByHList)) {
+          continue;
+        }
+
+        let pywpbpGroupList = pywpbpList.filter(elem => elem.comCode == prGroupH.prcomCode);
+        if (arrayUtil.isEmpty(pywpbpGroupList)) {
+          continue;
+        }
+
+        let checkPRGroupDataExist = false;
+
+        seq++
+        let seqText = String(seq).padStart(4, "0");
+        // let curPRNo = prGroupH.prGroup + '-'+ currentDateBE.format('YYYY') + currentDateBE.format('MM') + seqText;
+        let tmpNumOfTime = (numOfTime < 10) ? '0' + numOfTime : numOfTime;
+
+        //Pay type condition
+        let payType = '';
+        switch(selection.payType) {
+          case globalConstant.pyNormalCycle: 
+            payType = 'N';
+            break;
+          case globalConstant.pyOffCycle: 
+            payType = 'S';
+            break;
+        }
+        
+        let curPRNo = prGroupH.prGroup + '-' + currentDateBE.format('YYYY') + currentDateBE.format('MM') + payType + seqText  + tmpNumOfTime;
+        // let curPRNo = prGroupH.prGroup + '-' + currentDateBE.format('YYYY') + currentDateBE.format('MM') + seqText + tmpNumOfTime;
+        let invoiceNo = prGroupH.prGroup + currentDate.format('YYYY') + currentDate.format('MM') + seqText;
+
+        if (!tmpInvoiceTotal.hasOwnProperty(invoiceNo)) {
+          tmpInvoiceTotal[invoiceNo] = 0;
+        }
+
+        let wtCodeList = [...new Map(prGroupDByHList.map(item => [item['prwtCode'], item.prwtCode])).values()];
+
+        for (let pywpbpGroup of pywpbpGroupList) {
+
+          //Get py result directory
+          let payrollResultDir = payrollResultDirList.find(elem => elem.id == pywpbpGroup.rgdirID);
+
+          //Get RT data
+          let paramRT = {
+            wtCodeList: wtCodeList,
+            rgdirID: pywpbpGroup.rgdirID,
+            retroRgdirID: payrollResultDir.retroRgdirID,
+            wpbpNo: pywpbpGroup.wpbpNo,
+            payrollResultDir: payrollResultDir
+          };
+
+          let rtList = [];
+          functionReturn = await this.getRTResult(paramRT);
+          if (!functionReturn.success || arrayUtil.isEmpty(functionReturn.result)) {
+            continue;
+          }
+
+          rtList = functionReturn.result;
+
+          for (let rt of rtList) {
+
+            let prGroupDRTList = prGroupDByHList.filter(elem => elem.prwtCode == rt.wtCode);
+            if (arrayUtil.isEmpty(prGroupDRTList)) {
+              continue;
+            }
+            for (let prGroupDRT of prGroupDRTList) {
+
+              //Cal RT amount
+              let itemAmount = rt.amount * prGroupDRT.prRate;
+
+              if (itemAmount == 0) {
+                continue;
+              }
+
+              // let curItemKey = invoiceNo + '_' + prGroupDRT.prItemCode;
+              let curItemKey = invoiceNo + '_' + prGroupDRT.prDescriptionPRGroup;
+
+              if (!tmpItemTotal.hasOwnProperty(curItemKey)) {
+                tmpItemTotal[curItemKey] = 0;
+              }
+
+              tmpItemTotal[curItemKey] = mathUtil.round((tmpItemTotal[curItemKey] + itemAmount), 2);
+              tmpInvoiceTotal[invoiceNo] = mathUtil.round((tmpInvoiceTotal[invoiceNo] + itemAmount), 2);
+
+              let resultData = clone(tmpResult);
+              resultData.numOfTime = numOfTime;
+              resultData.prNo = curPRNo;
+              resultData.invoiceNo = invoiceNo;
+              resultData.itemCode = prGroupDRT.prItemCode;
+              resultData.itemDesc = prGroupDRT.prDescriptionPRGroup;
+              resultData.budgetCode = prGroupDRT.prBudgetCode;
+              resultData.paymentTerms = 'Immediate';    //Fix
+              resultData.invoiceDate = new Date(selection.invoiceDate);
+              resultData.paymentBy = prGroupH.prPaymentBy;
+              resultData.paidtoName = prGroupH.prPaidToName;
+              resultData.payGroup = 'SALARY';         //Fix
+              resultData.requestSentDttm = postDateTime;
+              resultData.processAt = postDateTime;
+              resultData.processBy = processBy;
+
+              // let payrollResultDir = payrollResultDirList.find(elem => elem.id == pywpbpGroup.rgdirID);
+              if (!jsonUtil.isEmpty(payrollResultDir)) {
+                resultData.inPeriod = payrollResultDir.period;
+                resultData.inYear = payrollResultDir.year;
+                resultData.payType = payrollResultDir.payType;
+                resultData.paymentDueDate = payrollResultDir.paymentDate;
+
+                //Collect empCode
+                if (!empCount.hasOwnProperty(curItemKey)) {
+                  empCount[curItemKey] = {
+                    count: 0,
+                    empList: []
+                  };
+                }
+
+                let empIndex = empCount[curItemKey].empList.findIndex(elem => elem == payrollResultDir.empCode);
+                if (empIndex < 0) {
+                  empCount[curItemKey].count++;
+                  empCount[curItemKey].empList.push(payrollResultDir.empCode);
+                }
+              }
+
+              let resultDataIndex = resultDataList.findIndex(elem => elem.invoiceNo == resultData.invoiceNo &&
+                elem.itemDesc == resultData.itemDesc);
+              if (resultDataIndex > -1) {
+                continue;
+              }
+
+              resultDataList.push(resultData);
+
+              checkPRGroupDataExist = true;
+            }
+
+          }
+        }
+
+        if (!checkPRGroupDataExist) {
+          seq--;
+        }
+
+      }
+
+      //No result found
+      if (arrayUtil.isEmpty(resultDataList)) {
+        functionReturn.success = false;
+        functionReturn.message = translation.getTranslateText('tenant.symc.payrollToJoget.error.noPayrollResultFound');
+        return functionReturn;
+      }
+
+      //Set total amount / person
+      for (let i = 0; i < resultDataList.length; i++) {
+
+        //Total invoice amount
+        if (tmpInvoiceTotal.hasOwnProperty(resultDataList[i].invoiceNo)) {
+          resultDataList[i].totalAmount = tmpInvoiceTotal[resultDataList[i].invoiceNo];
+        }
+
+        // let curItemKey = resultDataList[i].invoiceNo + '_' + resultDataList[i].itemCode;
+        let curItemKey = resultDataList[i].invoiceNo + '_' + resultDataList[i].itemDesc;
+
+        //Total item amount
+        if (tmpItemTotal.hasOwnProperty(curItemKey)) {
+          resultDataList[i].amount = tmpItemTotal[curItemKey];
+        }
+
+        //Total person
+        if (empCount.hasOwnProperty(curItemKey)) {
+          resultDataList[i].totalPerson = empCount[curItemKey].count;
+        }
+      }
+      bgProcess.updateStepProgress(globalConstant.bgStepSelectData.id, ++countProgress, totalDatabase);
+
+
+      functionReturn.success = true;
+      functionReturn.result.data = resultDataList;
+      functionReturn.result.excelFieldList = arrayField;
+
+    } catch (error) {
+      helper.logMessage('error', error.stack, 'tenant/symc/payrolltojoget/util - prepareData', '', '', '', '');
+      functionReturn.success = false;
+      functionReturn.message = translation.getTranslateText('common.error.exception');
+    }
+
+    return functionReturn;
+
+  }
+
+  prepareStructure() {
+    let result = {};
+
+    let arrayFieldList = [];
+    arrayFieldList.push({ field: 'inPeriod', type: 'I', value: 0, excelHeader: translation.getTranslateText('tenant.symc.payrollToJoget.excel.inPeriod') });
+    arrayFieldList.push({ field: 'inYear', type: 'I', value: 0, excelHeader: translation.getTranslateText('tenant.symc.payrollToJoget.excel.inYear') });
+    arrayFieldList.push({ field: 'numOfTime', type: 'I', value: 0, excelHeader: translation.getTranslateText('tenant.symc.payrollToJoget.excel.numOfTime') });
+    arrayFieldList.push({ field: 'payType', type: 'CC', value: '', excelHeader: translation.getTranslateText('tenant.symc.payrollToJoget.excel.payType') });
+    arrayFieldList.push({ field: 'totalPerson', type: 'I', value: 0, excelHeader: translation.getTranslateText('tenant.symc.payrollToJoget.excel.totalPerson') });
+    arrayFieldList.push({ field: 'prNo', type: 'C', value: '', excelHeader: translation.getTranslateText('tenant.symc.payrollToJoget.excel.prNo') });
+    arrayFieldList.push({ field: 'itemCode', type: 'C', value: '', excelHeader: translation.getTranslateText('tenant.symc.payrollToJoget.excel.itemCode') });
+    arrayFieldList.push({ field: 'amount', type: 'DEC', value: 0, excelHeader: translation.getTranslateText('tenant.symc.payrollToJoget.excel.amount') });
+    arrayFieldList.push({ field: 'itemDesc', type: 'C', value: '', excelHeader: translation.getTranslateText('tenant.symc.payrollToJoget.excel.itemDesc') });
+    arrayFieldList.push({ field: 'budgetCode', type: 'C', value: '', excelHeader: translation.getTranslateText('tenant.symc.payrollToJoget.excel.budgetCode') });
+    arrayFieldList.push({ field: 'invoiceNo', type: 'C', value: '', excelHeader: translation.getTranslateText('tenant.symc.payrollToJoget.excel.invoiceNo') });
+    arrayFieldList.push({ field: 'paymentTerms', type: 'C', value: '', excelHeader: translation.getTranslateText('tenant.symc.payrollToJoget.excel.paymentTerms') });
+    arrayFieldList.push({ field: 'invoiceDate', type: 'DATE', value: null, excelHeader: translation.getTranslateText('tenant.symc.payrollToJoget.excel.invoiceDate') });
+    arrayFieldList.push({ field: 'paymentBy', type: 'C', value: '', excelHeader: translation.getTranslateText('tenant.symc.payrollToJoget.excel.paymentBy') });
+    arrayFieldList.push({ field: 'totalAmount', type: 'DEC', value: 0, excelHeader: translation.getTranslateText('tenant.symc.payrollToJoget.excel.totalAmount') });
+    arrayFieldList.push({ field: 'paidtoName', type: 'C', value: '', excelHeader: translation.getTranslateText('tenant.symc.payrollToJoget.excel.paidtoName') });
+    arrayFieldList.push({ field: 'paymentDueDate', type: 'DATE', value: null, excelHeader: translation.getTranslateText('tenant.symc.payrollToJoget.excel.paymentDueDate') });
+    arrayFieldList.push({ field: 'payGroup', type: 'CC', value: '', excelHeader: translation.getTranslateText('tenant.symc.payrollToJoget.excel.payGroup') });
+    arrayFieldList.push({ field: 'requestSentDttm', type: 'DATETIME', value: null, excelHeader: translation.getTranslateText('tenant.symc.payrollToJoget.excel.requestSentDttm') });
+    arrayFieldList.push({ field: 'responseMessageID', type: 'C', value: '', excelHeader: translation.getTranslateText('tenant.symc.payrollToJoget.excel.responseMessageID') });
+    arrayFieldList.push({ field: 'responseBusinessEvent', type: 'C', value: '', excelHeader: translation.getTranslateText('tenant.symc.payrollToJoget.excel.responseBusinessEvent') });
+    arrayFieldList.push({ field: 'responseSourceSystemID', type: 'CC', value: '', excelHeader: translation.getTranslateText('tenant.symc.payrollToJoget.excel.responseSourceSystemID') });
+    arrayFieldList.push({ field: 'responseSentDttm', type: 'DATETIME', value: null, excelHeader: translation.getTranslateText('tenant.symc.payrollToJoget.excel.responseSentDttm') });
+    arrayFieldList.push({ field: 'responseResponseDttm', type: 'DATETIME', value: null, excelHeader: translation.getTranslateText('tenant.symc.payrollToJoget.excel.responseResponseDttm') });
+    arrayFieldList.push({ field: 'responseStatus', type: 'CC', value: '', excelHeader: translation.getTranslateText('tenant.symc.payrollToJoget.excel.responseStatus') });
+    arrayFieldList.push({ field: 'responseMessage', type: 'C', value: '', excelHeader: translation.getTranslateText('tenant.symc.payrollToJoget.excel.responseMessage') });
+    arrayFieldList.push({ field: 'responseStatusCode', type: 'CC', value: '', excelHeader: translation.getTranslateText('tenant.symc.payrollToJoget.excel.responseStatusCode') });
+    arrayFieldList.push({ field: 'processAt', type: 'DATETIME', value: null, excelHeader: translation.getTranslateText('tenant.symc.payrollToJoget.excel.processAt') });
+    arrayFieldList.push({ field: 'processBy', type: 'C', value: '', excelHeader: translation.getTranslateText('tenant.symc.payrollToJoget.excel.processBy') });
+
+    for (let arrayField of arrayFieldList) {
+      result[arrayField.field] = arrayField.value;
+    }
+
+    return {
+      fieldList: arrayFieldList,
+      data: result
+    };
+  }
+
+  async getPayrollArea(selection) {
+
+    let functionReturn = new FunctionReturn();
+
+    try {
+
+      let condition = {
+        payrollAreaCode: selection.payrollArea
+      };
+      let dbProcess = new DBProcess();
+
+      let payrollAreaList = await dbProcess.getPayrollArea(condition);
+
+      if (!arrayUtil.isEmpty(payrollAreaList)) {
+        functionReturn.success = true;
+        functionReturn.result = payrollAreaList;
+      } else {
+        functionReturn.success = false;
+        functionReturn.message = translation.getTranslateText('tenant.symc.payrollToJoget.error.noPayrollAreaFound'); //'No Payroll Area found'
+      }
+
+    } catch (error) {
+      helper.logMessage('error', error.stack, 'tenant/symc/payrolltojoget/util - getPayrollArea', '', '', '', '');
+      functionReturn.success = false;
+      functionReturn.message = translation.getTranslateText('common.error.exception');
+    }
+
+    return functionReturn;
+  }
+
+  async getPayrollPeriod(selection) {
+
+    let functionReturn = new FunctionReturn();
+
+    try {
+      let condition = {};
+      let dbProcess = new DBProcess();
+
+      if (selection.isOffCycle) {
+        let keyDate = new Date(selection.paymentDate);
+
+        if (keyDate != 'Invalid Date') {
+          let payrollPeriod = {
+            year: keyDate.getFullYear(),
+            period: 0,
+            paymentDate: keyDate,
+            payrollAreaCode: selection.payrollArea
+          }
+          let payrollPeriodList = [];
+          payrollPeriodList.push(payrollPeriod);
+
+          functionReturn.success = true;
+          functionReturn.result.payrollPeriodList = payrollPeriodList;
+          functionReturn.result.period = payrollPeriod.period;
+          functionReturn.result.year = payrollPeriod.year;
+        } else {
+          functionReturn.success = false
+          functionReturn.message = translation.getTranslateText('common.error.invalidPaymentDate'); //'Invalid payment date'
+          return functionReturn;
+
+        }
+        // if(moment.isDate(selection.paymentDate)) {
+        //   condition = {
+        //     paymentDate: moment(selection.paymentDate),
+        //     payrollAreaCode: {
+        //         [Op.in]: [selection.payrollArea]
+        //     }
+        //   }
+        // } else {
+        //   functionReturn.success = false;
+        //   functionReturn.message = translation.getTranslateText('tenant.symc.payrollToJoget.error.noPayrollPeriodFound'); 
+        //   return functionReturn;
+        // }
+      } else {
+
+        if (selection.period && selection.year) {
+          condition = {
+            period: selection.period,
+            year: selection.year,
+            payrollAreaCode: {
+              [Op.in]: [selection.payrollArea]
+            }
+          }
+        } else {
+          functionReturn.success = false;
+          functionReturn.message = translation.getTranslateText('tenant.symc.payrollToJoget.error.noPayrollPeriodFound');
+          return functionReturn;
+        }
+
+        let payrollPeriodList = await dbProcess.getPayrollPeriod(condition);
+        if (!arrayUtil.isEmpty(payrollPeriodList)) {
+          functionReturn.success = true;
+          functionReturn.result.payrollPeriodList = payrollPeriodList;
+          functionReturn.result.period = payrollPeriodList[0].period;
+          functionReturn.result.year = payrollPeriodList[0].year;
+
+          // if(selection.isOffCycle) {
+          //   functionReturn.result.startDate = payrollPeriodList[0].paymentDate;
+          //   functionReturn.result.endDate = payrollPeriodList[0].paymentDate;
+          // } else {
+          functionReturn.result.startDate = payrollPeriodList[0].startDate;
+          functionReturn.result.endDate = payrollPeriodList[0].endDate;
+          // }
+
+        } else {
+          functionReturn.success = false;
+          functionReturn.message = translation.getTranslateText('tenant.symc.payrollToJoget.error.noPayrollPeriodFound');
+          return functionReturn;
+        }
+
+      }
+
+    } catch (error) {
+      helper.logMessage('error', error.stack, 'tenant/symc/payrolltojoget/util - getPayrollPeriod', '', '', '', '');
+      functionReturn.success = false;
+      functionReturn.message = translation.getTranslateText('common.error.exception');
+    }
+
+    return functionReturn;
+  }
+
+  async getPayrollResultData(selection) {
+
+    let functionReturn = new FunctionReturn();
+
+    try {
+
+      //Payroll result directory
+      let condition = {};
+      let payrollResultDirList = [];
+      let pywpbpResultList = [];
+      let rtResultList = [];
+      let dbProcess = new DBProcess();
+
+      for (let payrollPeriod of selection.payrollPeriodList) {
+
+        if (!selection.isOffCycle) {
+          condition = {
+            inPeriod: payrollPeriod.period,
+            inYear: payrollPeriod.year,
+            payType: globalConstant.pyNormalCycle,
+            payrollAreaCode: payrollPeriod.payrollAreaCode
+          }
+        } else {
+          condition = {
+            paymentDate: payrollPeriod.paymentDate,
+            payType: globalConstant.pyOffCycle,
+            payrollAreaCode: payrollPeriod.payrollAreaCode,
+            resultIndicator: 'A'
+          }
+        }
+
+        if (!arrayUtil.isEmpty(selection.empCodeList)) {
+          condition.empCode = selection.empCodeList;
+        }
+
+        let payrollPeriodResultList = await dbProcess.getPayrollDirectory(condition);
+        if (!arrayUtil.isEmpty(payrollPeriodResultList)) {
+          payrollResultDirList = payrollResultDirList.concat(payrollPeriodResultList);
+        }
+
+      }
+
+      if (arrayUtil.isEmpty(payrollResultDirList)) {
+        functionReturn.success = false;
+        functionReturn.message = translation.getTranslateText('tenant.symc.payrollToJoget.error.noPayrollResultFound');
+      }
+
+      //Get retro period data
+      let retroResultDirList = payrollResultDirList.filter(elem => elem.period != elem.forPeriod &&
+        elem.year != elem.forYear);
+      if (!arrayUtil.isEmpty(retroResultDirList)) {
+        for (let i = 0; i < retroResultDirList.length; i++) {
+          condition = {
+            empCode: retroResultDirList[i].empCode,
+            inPeriod: retroResultDirList[i].forPeriod,
+            inYear: retroResultDirList[i].forYear,
+            forPeriod: retroResultDirList[i].forPeriod,
+            forYear: retroResultDirList[i].forYear,
+            payType: globalConstant.pyNormalCycle,
+            payrollAreaCode: retroResultDirList[i].payrollAreaCode,
+            resultIndicator: globalConstant.pyResultDirResultIndicatorPrevious
+          }
+
+          let retroPeriodResultList = await dbProcess.getPayrollDirectory(condition);
+          if (!arrayUtil.isEmpty(retroPeriodResultList)) {
+            retroResultDirList[i].retroRgdirID = retroPeriodResultList[0].id;
+          }
+
+        }
+      }
+
+      let rgdirIdList = payrollResultDirList.map(a => a.id);
+
+      //PYWPBP
+      condition = {
+        rgdirID: rgdirIdList,
+        comCode: selection.comCode
+      };
+      let pywpbpList = await dbProcess.getPYWPBP(condition);
+      if (!arrayUtil.isEmpty(pywpbpList)) {
+        pywpbpResultList = pywpbpList;
+      }
+
+      functionReturn.success = true;
+      functionReturn.result.payrollResultDirList = payrollResultDirList;
+      functionReturn.result.pywpbpResultList = pywpbpResultList;
+      functionReturn.result.rgdirIdList = rgdirIdList;
+
+    } catch (error) {
+      helper.logMessage('error', error.stack, 'tenant/symc/payrolltojoget/util - getPayrollResultData', '', '', '', '');
+      functionReturn.success = false;
+      functionReturn.message = translation.getTranslateText('common.error.exception');
+    }
+
+    return functionReturn;
+  }
+
+  async getPRGroup(selection) {
+
+    let functionReturn = new FunctionReturn();
+
+    try {
+
+      let dbProcess = new DBProcess();
+      let condition = {
+        prStartDate: { [Op.lte]: new Date() },
+        prEndDate: { [Op.gte]: new Date() },
+      };
+
+      if (!arrayUtil.isEmpty(selection.prGroupList)) {
+        condition.prGroupCode = selection.prGroupList;
+      }
+
+      let prGroupHList = await dbProcess.getSYMCPRGroupHeader(condition);
+      if (arrayUtil.isEmpty(prGroupHList)) {
+        functionReturn.success = false;
+        functionReturn.message = translation.getTranslateText('tenant.symc.payrollToJoget.error.noPRGroupFound');
+        return functionReturn;
+      }
+
+      let prGroupHeaderIDList = prGroupHList.map(a => a.id);
+
+      condition = {
+        prGroupHeaderID: prGroupHeaderIDList
+      };
+      let prGroupDList = await dbProcess.getSYMCPRGroupDetail(condition);
+      if (arrayUtil.isEmpty(prGroupDList)) {
+        functionReturn.success = false;
+        functionReturn.message = translation.getTranslateText('tenant.symc.payrollToJoget.error.noPRGroupFound');
+        return functionReturn;
+      }
+
+      functionReturn.success = true;
+      functionReturn.result.prGroupHList = prGroupHList;
+      functionReturn.result.prGroupDList = prGroupDList;
+
+    } catch (error) {
+      helper.logMessage('error', error.stack, 'tenant/symc/payrolltojoget/util - getPRGroup', '', '', '', '');
+      functionReturn.success = false;
+      functionReturn.message = translation.getTranslateText('common.error.exception');
+    }
+
+    return functionReturn;
+  }
+
+  async getPostedResult(selection) {
+
+
+    let functionReturn = new FunctionReturn();
+
+    try {
+    } catch (error) {
+      helper.logMessage('error', error.stack, 'tenant/symc/payrolltojoget/util - getPostedResult', '', '', '', '');
+      functionReturn.success = false;
+      functionReturn.message = translation.getTranslateText('common.error.exception');
+    }
+
+    return functionReturn;
+
+  }
+
+  async getLastPostedResult(selection) {
+
+    let functionReturn = new FunctionReturn();
+
+    try {
+
+      let dbProcess = new DBProcess();
+
+      let condition = {
+        inPeriod: selection.period,
+        inYear: selection.year,
+      };
+      let symcLastPostedResult = await dbProcess.getLastSYMCPostedResult(condition);
+      if (jsonUtil.isEmpty(symcLastPostedResult)) {
+        functionReturn.success = false;
+        return functionReturn;
+      }
+
+      functionReturn.success = true;
+      functionReturn.result = symcLastPostedResult;
+
+    } catch (error) {
+      helper.logMessage('error', error.stack, 'tenant/symc/payrolltojoget/util - getLastPostedResult', '', '', '', '');
+      functionReturn.success = false;
+      functionReturn.message = translation.getTranslateText('common.error.exception');
+    }
+
+    return functionReturn;
+
+  }
+
+  async getRTResult(param) {
+    let functionReturn = new FunctionReturn();
+
+    try {
+      let dbProcess = new DBProcess();
+      let rtResultList = [];
+      // let payrollResultDir = param.payrollResultDir;
+
+      //RT
+      let condition = {
+        wtCode: param.wtCodeList,
+        rgdirID: param.rgdirID,
+        wpbpNo: param.wpbpNo
+      };
+      let rtList = await dbProcess.getRT(condition);
+      if (!arrayUtil.isEmpty(rtList)) {
+        rtResultList = rtList;
+      }
+
+      //Retro RT;
+      if (param.retroRgdirID) {
+        condition = {
+          wtCode: param.wtCodeList,
+          rgdirID: param.retroRgdirID
+        };
+        let retroRTList = await dbProcess.getRT(condition);
+        if (!arrayUtil.isEmpty(retroRTList)) {
+          for (let i = 0; i < rtResultList.length; i++) {
+            let retroAmount = 0;
+
+            let wtRTList = retroRTList.filter(elem => elem.wtCode == rtResultList[i].wtCode);
+            if (!arrayUtil.isEmpty(wtRTList)) {
+              for (let wtRT of wtRTList) {
+                retroAmount = retroAmount + wtRT.amount;
+              }
+            }
+
+            rtResultList[i].amount = rtResultList[i].amount - retroAmount;
+
+          }
+        }
+      }
+
+      functionReturn.success = true;
+      functionReturn.result = rtResultList;
+    } catch (error) {
+      helper.logMessage('error', error.stack, 'tenant/symc/payrolltojoget/util - getRTResult', '', '', '', '');
+      functionReturn.success = false;
+      functionReturn.message = translation.getTranslateText('common.error.exception');
+    }
+
+    return functionReturn;
+
+  }
+
+  async processToJoget(param) {
+
+    let functionReturn = new FunctionReturn();
+    let transaction = await db[reqContext.getTenantCode()].conn.transaction();
+
+    try {
+      let dbProcess = new DBProcess();
+      let resultDataList = param.resultDataList;
+      let postedDateTime = resultDataList[0].processAt;
+      let keyDatePosted = moment(postedDateTime).format('YYYYMMDDHHMMSS');
+      let sentDttm = moment(postedDateTime).format('YYYY-MM-DD HH:MM:SS');
+
+      //Get current instance ID
+      let instanceID = '';
+      functionReturn = await this.getInstanceID();
+      if (functionReturn.success) {
+        instanceID = functionReturn.result.lowValue;
+      }
+
+
+      let messageID = keyDatePosted + instanceID;
+
+      //Prepare posted message body
+      let requestList = [];
+
+      for (let resultData of resultDataList) {
+        let request = {};
+        request.pr_no = resultData.prNo;
+        request.payment_due_date = moment(resultData.paymentDueDate).format('YYYY-MM-DD');
+        request.invoice_no = resultData.invoiceNo;
+        request.invoice_date = moment(resultData.invoiceDate).format('YYYY-MM-DD');
+        request.payment_by = resultData.paymentBy;
+        request.paidto_name = resultData.paidtoName;
+        request.pay_group = resultData.payGroup;
+        request.payment_terms = resultData.paymentTerms;
+        request.total_amount = resultData.totalAmount;
+        request.budget_code = resultData.budgetCode;
+        request.item_code = resultData.itemCode;
+        request.item_desc = resultData.itemDesc;
+        request.amount = resultData.amount;
+        request.total_person = resultData.totalPerson;
+
+        requestList.push(request);
+      }
+
+      //Body
+      let body = {
+        messageID: messageID,
+        businessEvent: 'HrJogetPayroll',
+        sourceSystemID: 'IPOP',
+        sentDttm: sentDttm,
+        authorization: "BasicAuthen",
+        PayrollItems: requestList
+      };
+
+      //Post to JOGET
+      param.messageID = messageID;
+      param.requestBody = body;
+      functionReturn = await this.postToJoget(param);
+      if (functionReturn.success) {
+        let responseResult = functionReturn.result;
+        let responseMessageHeader = responseResult.messageHeader;
+        let responseStatus = responseResult.responseStatus;
+
+        //Modify result by response message
+        for (let i = 0; i < resultDataList.length; i++) {
+          resultDataList[i].responseMessageID = responseMessageHeader.messageID;
+          resultDataList[i].responseBusinessEvent = responseMessageHeader.businessEvent;
+          resultDataList[i].responseSourceSystemID = responseMessageHeader.sourceSystemID;
+          resultDataList[i].responseSentDttm = moment(responseMessageHeader.sentDttm, ["YYYY-MM-DD hh:mm:ss"]).toDate();
+          resultDataList[i].responseResponseDttm = moment(responseMessageHeader.responseDttm, ["YYYY-MM-DD hh:mm:ssA"]).toDate();
+          resultDataList[i].responseStatus = responseStatus.statusCode;
+          resultDataList[i].responseMessage = responseStatus.responseMessage;
+          resultDataList[i].responseStatusCode = responseStatus.statusCode;
+        }
+      } else {
+        //Modify result by response message
+        for (let i = 0; i < resultDataList.length; i++) {
+          resultDataList[i].responseStatus = globalConstant.messageTypeError;
+          resultDataList[i].responseMessage = functionReturn.message;
+          resultDataList[i].responseStatusCode = globalConstant.messageTypeError;
+        }
+      }
+
+      //Insert SYMCPostedResult
+      let createResultParam = {
+        dataList: resultDataList,
+        transaction: transaction
+      };
+      functionReturn = await dbProcess.bulkCreateSYMCPostedResult(createResultParam);
+      if (functionReturn.success) {
+        await transaction.commit();
+      } else {
+        await transaction.rollback();
+      }
+
+      functionReturn.success = true;
+
+    } catch (error) {
+      helper.logMessage('error', error.stack, 'tenant/symc/payrolltojoget/util- processToJoget', '', '', '', '');
+      functionReturn.success = false;
+      functionReturn.message = translation.getTranslateText('common.error.exception');
+      await transaction.rollback();
+    }
+
+    return functionReturn;
+
+  }
+
+  async getInstanceID(param) {
+
+    let functionReturn = new FunctionReturn();
+
+    try {
+
+      let dbProcess = new DBProcess();
+      let condition = {
+        paramGroup: 'INF',
+        paramName: 'SYMC_JOGET_INSTANCE_ID',
+        startDate: { [Op.lte]: new Date() },
+        endDate: { [Op.gte]: new Date() }
+      };
+
+      functionReturn.result = await dbProcess.getParameter(condition);
+
+      functionReturn.success = true
+
+    } catch (error) {
+      helper.logMessage('error', error.stack, 'tenant/symc/payrolltojoget/util- postToJoget', '', '', '', '');
+      functionReturn.success = false;
+      functionReturn.message = translation.getTranslateText('common.error.exception');
+    }
+
+    return functionReturn;
+
+  }
+
+  async postToJoget(param) {
+
+    let functionReturn = new FunctionReturn();
+
+    try {
+
+      let dbProcess = new DBProcess();
+      let serverConnParam = {
+        connCode: connCode
+      };
+      let serverConnectionData = await dbProcess.getServerConnection(serverConnParam);
+      if (jsonUtil.isEmpty(serverConnectionData)) {
+        functionReturn.success = false;
+        functionReturn.message = translation.getTranslateText('tenant.symc.payrollToJoget.error.noServerConnetionFound');
+        return functionReturn;
+      }
+
+      let requestBody = param.requestBody;
+      param.serverConnectionData = serverConnectionData;
+
+      let host = serverConnectionData.host;
+      let hrPayrollPath = serverConnectionData.defaultPath;
+
+      //Get auth
+      let service = new JOGETService();
+      functionReturn = await service.genAuthorization(param);
+      if (!functionReturn.success) {
+        functionReturn.success = false;
+        functionReturn.message = translation.getTranslateText('tenant.symc.payrollToJoget.error.noServerConnetionFound');
+      }
+
+      let authentication = functionReturn.result;
+
+      let url = `${host}/${hrPayrollPath}/`;
+
+      //Post
+      functionReturn.clear();
+      try {
+        let response = await axios.post(url, requestBody, {
+          headers: {
+            Authorization: authentication,
+            'Content-Type': 'text/plain'
+          }
+        });
+
+        functionReturn.success = true;
+        functionReturn.result = response.data.result;
+      } catch (error) {
+        helper.logMessage('error', error.stack, 'tenant/symc/payrolltojoget/util- postToJoget (Call api JOGETAPI) ', '', '', '', '');
+        let errorMessage = error.response.statusText;
+
+        functionReturn.success = false;
+        functionReturn.message = errorMessage;
+        return functionReturn;
+      }
+
+    } catch (error) {
+      helper.logMessage('error', error.stack, 'tenant/symc/payrolltojoget/util- postToJoget', '', '', '', '');
+      functionReturn.success = false;
+      functionReturn.message = translation.getTranslateText('common.error.exception');
+    }
+
+    return functionReturn;
+  }
+
+}
+exports.Util = Util;
+
+const clone = (src) => {
+  return Object.assign({}, src);
+};
+
+[File Ends] util.js
+
+
+<-- File Content Ends
+
